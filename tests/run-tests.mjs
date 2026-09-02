@@ -331,6 +331,7 @@ test("images of different sizes diff by pixels, note the missing text layer", as
 });
 
 test("two-file drop entry point works", async () => {
+  if (process.env.BASE) { console.log("     (skipped on a deployed copy — fixtures aren't served there)"); return; }
   const { page } = await newPage();
   await page.evaluate(async () => {
     const get = async (n) =>
