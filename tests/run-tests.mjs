@@ -581,6 +581,29 @@ test("real proof pair (local only) — auto text view, page range, hand-checked 
   await page.close();
 });
 
+test("tightly justified text without space glyphs still diffs word by word", async () => {
+  const { page, errors } = await newPage();
+  await uploadPair(page, "tightv1.pdf", "tightv2.pdf");
+  await waitScan(page);
+  await page.click('#cmodes [data-mode="text"]');
+  await waitDocDiff(page);
+  const w = await docWords(page);
+  assertEq(JSON.stringify(w.del), JSON.stringify(["quick"]), "only the edited word removed — no welded tokens");
+  assertEq(JSON.stringify(w.ins), JSON.stringify(["swift"]), "only the edited word added");
+  const panel = await page.$eval("#cdoctext", (e) => e.textContent);
+  assert(!/brownfox|overthe|withoutany|jumpsover/.test(panel), `no welded words in the text view: "${panel.slice(0, 120)}"`);
+  // the per-page word boxes use the same word breaks
+  await page.click('#cmodes [data-mode="side"]');
+  const perPage = await page.evaluate(() => {
+    const e = window.__diffcat.state.cache.get(0);
+    return { words: e.text.wordsB.length, del: e.text.delCount, ins: e.text.insCount };
+  });
+  assertEq(perPage.words, 27, "every word on the tight page is its own box");
+  assert(perPage.del === 1 && perPage.ins === 1, `page view sees one changed word: −${perPage.del} +${perPage.ins}`);
+  assertEq(errors.length, 0, `console errors: ${errors.join(" | ")}`);
+  await page.close();
+});
+
 test("start over clears everything and a new pair loads cleanly", async () => {
   const { page } = await newPage();
   await uploadPair(page, "diffv1.pdf", "diffv2.pdf");
