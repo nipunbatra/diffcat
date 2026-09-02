@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self'; img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="description" content="Diffcat — compare two PDFs entirely in your browser. Aligned pages side by side, an overlay, and a whole-document text diff that survives re-typesetting. No uploads, no servers, no analytics.">
+<title>Diffcat — compare two PDFs, nothing leaves your device</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="./" aria-label="Diffcat home">
+    <svg class="mark" viewBox="0 0 120 52" aria-hidden="true" focusable="false">
+      <rect x="6" y="14" width="44" height="34" rx="3" fill="var(--del)" opacity="0.9"/>
+      <rect x="30" y="6" width="44" height="34" rx="3" fill="var(--add)" opacity="0.9"/>
+      <polygon points="82,30 90,8 101,30" fill="currentColor"/>
+      <polygon points="103,30 111,8 119,30" fill="currentColor"/>
+      <rect x="78" y="28" width="42" height="20" rx="4" fill="currentColor"/>
+      <circle cx="92" cy="38" r="3.2" fill="var(--paper)"/>
+      <circle cx="108" cy="38" r="3.2" fill="var(--paper)"/>
+    </svg>
+    <span class="wordmark">Diffcat</span>
+  </a>
+  <div class="stamp" role="note" aria-label="100 percent local, no uploads ever">
+    100% local
+    <span>no uploads · ever</span>
+  </div>
+  <a class="srclink mono" href="https://github.com/nipunbatra/diffcat">source ↗</a>
+</header>
+
+<main>
+
+<section id="hero">
+  <h1>What <span class="hl">changed</span> between two&nbsp;PDFs?</h1>
+  <p class="lede">Drop a draft and its revision — or a preprint and the publisher's proof — and see every
+  difference: pages aligned side by side, an overlay, or a clean text diff that survives re-typesetting.
+  Everything runs in this tab; <em>nothing is uploaded</em>.</p>
+</section>
+
+<div class="cslots" id="cslots">
+  <div id="slotA" class="sheet dropzone cslot" tabindex="0" role="button" aria-label="Choose the old file to compare">
+    <input type="file" id="fileA" accept="application/pdf,.pdf,image/png,image/jpeg" hidden>
+    <div class="cslot-k mono">old</div>
+    <div class="cslot-name mono" id="slotAname">drop or click — pdf · png · jpeg</div>
+  </div>
+  <button id="cswap" class="btn ghost cswap" type="button" title="swap old and new" aria-label="Swap old and new" disabled>⇄</button>
+  <div id="slotB" class="sheet dropzone cslot" tabindex="0" role="button" aria-label="Choose the new file to compare">
+    <input type="file" id="fileB" accept="application/pdf,.pdf,image/png,image/jpeg" hidden>
+    <div class="cslot-k mono">new</div>
+    <div class="cslot-name mono" id="slotBname">drop or click — pdf · png · jpeg</div>
+  </div>
+</div>
+<p class="csample-row mono" id="csamplerow">drop both files at once anywhere on this page — or <button id="csample" class="btn ghost" type="button">try a sample pair</button></p>
+
+<section id="facts" class="facts" aria-label="How Diffcat works">
+  <div class="fact">
+    <h2 class="mono">pages aligned, not just numbered</h2>
+    <p>An inserted cover page or a re-flowed chapter doesn't make every later page look
+    "changed": pages are matched by their <strong>content</strong>, and pages that were merged
+    or split are shown with their counterpart.</p>
+  </div>
+  <div class="fact">
+    <h2 class="mono">a text diff that survives typesetting</h2>
+    <p>Running heads, page numbers, hyphenation and font changes are ignored; the text of both
+    files is diffed as one document, word by word, with <strong>relocated passages shown as
+    moves</strong> rather than edits.</p>
+  </div>
+  <div class="fact">
+    <h2 class="mono">local by design</h2>
+    <p>A strict Content-Security-Policy forbids all network requests, so the page couldn't
+    upload your files even if it wanted to. Load it once and it works offline.
+    <a href="https://github.com/nipunbatra/diffcat">Open source, AGPL-3.0.</a></p>
+  </div>
+</section>
+
+<section id="compare" hidden>
+  <div class="toolbar" id="cbar" hidden>
+    <span class="fname mono" id="cnames" title=""></span>
+    <span class="csum mono" id="csummary" role="status"></span>
+    <div class="group" id="cmodes" role="toolbar" aria-label="Diff views">
+      <button class="btn tool on" data-mode="side" type="button" aria-pressed="true" title="old and new page next to each other, with removed/added words tinted">◫ side by side</button>
+      <button class="btn tool" data-mode="overlay" type="button" aria-pressed="false" title="both pages blended: red ink exists only in the old file, teal only in the new">▩ overlay</button>
+      <button class="btn tool" data-mode="swipe" type="button" aria-pressed="false" title="drag a divider across the page">⇋ swipe</button>
+      <button class="btn tool" data-mode="text" type="button" aria-pressed="false" title="the whole document's text, diffed word by word across pages">≡ text</button>
+    </div>
+    <button class="btn tool on" id="chl" type="button" aria-pressed="true" title="tint removed/added words and outline changed regions">▤ highlights</button>
+    <div class="group pager" id="cpager">
+      <button class="btn" id="cprev" type="button" aria-label="Previous page">◀</button>
+      <span class="mono" id="cpageinfo">1 / 1</span>
+      <button class="btn" id="cnext" type="button" aria-label="Next page">▶</button>
+    </div>
+    <div class="group grow-right">
+      <button class="btn ghost" id="cclose" type="button">✕ start over</button>
+      <button class="btn" id="cimage" type="button" title="save the current page view as a PNG">page image</button>
+      <button class="btn primary" id="cdownload" type="button" title="a self-contained HTML report: page map and the full text diff — printable">download report</button>
+    </div>
+  </div>
+
+  <p id="cnote" class="note mono" hidden></p>
+
+  <div class="rangebar mono" id="crangebar" hidden>
+    <span class="rangek">pages</span>
+    <label class="rangeside">old
+      <input type="number" id="rA0" class="rangein" min="1" aria-label="Old file: first page to compare">
+      –
+      <input type="number" id="rA1" class="rangein" min="1" aria-label="Old file: last page to compare">
+    </label>
+    <label class="rangeside">new
+      <input type="number" id="rB0" class="rangein" min="1" aria-label="New file: first page to compare">
+      –
+      <input type="number" id="rB1" class="rangein" min="1" aria-label="New file: last page to compare">
+    </label>
+    <button class="btn" id="crangeapply" type="button">compare these pages</button>
+    <button class="btn ghost" id="crangeall" type="button" title="compare all pages again">↺ reset</button>
+    <span id="crangeinfo" class="rangeinfo" role="status"></span>
+    <span class="rangehint">skip a cover sheet, metadata page or appendix</span>
+  </div>
+
+  <div id="cviews" hidden>
+    <div class="cstrip" id="cstrip" aria-label="Pages"></div>
+    <div class="cpair" id="cpair">
+      <figure class="cfig">
+        <figcaption class="mono">old — <span id="capA"></span></figcaption>
+        <div class="canvas-wrap sheet"><canvas id="cvA" aria-label="Old version of the current page"></canvas></div>
+      </figure>
+      <figure class="cfig">
+        <figcaption class="mono">new — <span id="capB"></span></figcaption>
+        <div class="canvas-wrap sheet"><canvas id="cvB" aria-label="New version of the current page"></canvas></div>
+      </figure>
+    </div>
+    <div id="cone" hidden>
+      <div class="canvas-wrap sheet"><canvas id="cvO" aria-label="Overlay of both versions of the current page"></canvas></div>
+    </div>
+    <div id="cdoctext" class="ctext doctext sheet" aria-label="Whole-document text differences" hidden></div>
+    <div class="statusline mono">
+      <span id="cstatus" role="status"></span>
+      <span class="hint" id="clegend"></span>
+    </div>
+    <details class="ctextwrap sheet" id="ctextwrap">
+      <summary class="mono" id="ctextsummary">text changes on this page</summary>
+      <div class="ctext" id="ctext"></div>
+    </details>
+  </div>
+</section>
+
+</main>
+
+<div id="busy" class="busy" hidden>
+  <div class="busy-card sheet mono" role="status"><span id="busytext">working…</span></div>
+</div>
+
+<footer class="mono">
+  <span>diffcat</span> · nothing you open here is sent anywhere ·
+  engine: <a href="https://mupdf.com">MuPDF</a> (AGPL-3.0) ·
+  sibling of <a href="https://nipunbatra.github.io/redacat/">redacat</a> ·
+  <a href="https://github.com/nipunbatra/diffcat">view source</a>
+</footer>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

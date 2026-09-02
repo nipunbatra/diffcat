@@ -1,0 +1,186 @@
+// Generates the PDF fixtures in tests/fixtures/: version pairs with known
+// differences (changed words, inserted cover page, re-pagination, a moved
+// paragraph) plus an AES-encrypted file.
+import { PDFDocument, StandardFonts } from "pdf-lib";
+import * as mupdf from "mupdf";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Deliberately fake password for the generated, gitignored test PDF.
+// Not a credential for anything — do not "rotate", there is nothing to rotate.
+export const FIXTURE_PW = "fake-test-password-not-a-real-secret";
+
+const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+fs.mkdirSync(DIR, { recursive: true });
+const write = (name, bytes) => {
+  fs.writeFileSync(path.join(DIR, name), bytes);
+  console.log("wrote", name, bytes.length, "bytes");
+};
+
+async function newDoc() {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  return { doc, font };
+}
+
+// ---- basic.pdf: 2 plain pages; also the plaintext twin of protected.pdf ----
+{
+  const { doc, font } = await newDoc();
+  const p1 = doc.addPage([612, 792]);
+  p1.drawText("PAGE ONE HEADER", { x: 72, y: 720, size: 20, font });
+  p1.drawText("TOP-SECRET-ALPHA", { x: 72, y: 600, size: 14, font });
+  p1.drawText("public line one stays", { x: 72, y: 560, size: 14, font });
+  const p2 = doc.addPage([612, 792]);
+  p2.drawText("TOP-SECRET-BRAVO", { x: 72, y: 700, size: 14, font });
+  p2.drawText("public line two stays", { x: 72, y: 660, size: 14, font });
+  write("basic.pdf", await doc.save());
+}
+
+// ---- protected.pdf: AES-128, locked with the fake fixture password ----
+{
+  const basic = fs.readFileSync(path.join(DIR, "basic.pdf"));
+  const doc = mupdf.Document.openDocument(basic, "application/pdf");
+  const out = doc.saveToBuffer(`encrypt=aes-128,user-password=${FIXTURE_PW},owner-password=${FIXTURE_PW},permissions=-4`);
+  write("protected.pdf", out.asUint8Array());
+  const check = mupdf.Document.openDocument(out.asUint8Array().slice(), "application/pdf");
+  if (!check.needsPassword()) throw new Error("protected.pdf is not actually encrypted!");
+  if (check.authenticatePassword(FIXTURE_PW) === 0) throw new Error("password mismatch");
+}
+
+// ---- diffv1.pdf / diffv2.pdf: a version pair with known differences ----
+// page 1: one changed word + one added line;  page 2: identical;
+// page 3: changed sentence;  page 4: exists only in v2.
+{
+  const mk = async (version) => {
+    const { doc, font } = await newDoc();
+    const p1 = doc.addPage([612, 792]);
+    p1.drawText("DIFF FIXTURE TITLE", { x: 72, y: 720, size: 20, font });
+    p1.drawText(
+      version === 1 ? "amount due USD-250000 total" : "amount due USD-275000 total",
+      { x: 72, y: 600, size: 14, font },
+    );
+    p1.drawText("shared line stays identical", { x: 72, y: 560, size: 14, font });
+    if (version === 2) p1.drawText("ADDED-LINE-V2 appears here", { x: 72, y: 520, size: 14, font });
+    const p2 = doc.addPage([612, 792]);
+    p2.drawText("identical second page", { x: 72, y: 700, size: 14, font });
+    const p3 = doc.addPage([612, 792]);
+    p3.drawText(
+      version === 1 ? "third page with OBSOLETE-CLAUSE inside" : "third page with nothing special",
+      { x: 72, y: 700, size: 14, font },
+    );
+    if (version === 2) {
+      const p4 = doc.addPage([612, 792]);
+      p4.drawText("appendix page only in v2", { x: 72, y: 700, size: 14, font });
+    }
+    return doc.save();
+  };
+  write("diffv1.pdf", await mk(1));
+  write("diffv2.pdf", await mk(2));
+}
+
+// ---- shiftv1.pdf / shiftv2.pdf: v2 inserts a cover page at the front ----
+// Without page alignment every page after the cover would look "changed".
+// Expected pairing: +cover, p1<->p2 same, p2<->p3 changed (one word), p3<->p4 same.
+{
+  const pageOf = (doc, font, lines) => {
+    const p = doc.addPage([612, 792]);
+    let y = 700;
+    for (const l of lines) { p.drawText(l, { x: 72, y, size: 14, font }); y -= 40; }
+  };
+  const chapters = (mid) => [
+    ["CHAPTER ONE shared opening", "the quick brown fox jumps", "over the lazy dog daily"],
+    ["CHAPTER TWO results section", `the ${mid} measurement was stable`, "across all trials we observed"],
+    ["CHAPTER THREE conclusion", "we conclude nothing surprising", "future work remains open"],
+  ];
+  {
+    const { doc, font } = await newDoc();
+    for (const lines of chapters("original")) pageOf(doc, font, lines);
+    write("shiftv1.pdf", await doc.save());
+  }
+  {
+    const { doc, font } = await newDoc();
+    pageOf(doc, font, ["COVER SHEET brand new frontmatter", "inserted only in version two"]);
+    for (const lines of chapters("revised")) pageOf(doc, font, lines);
+    write("shiftv2.pdf", await doc.save());
+  }
+}
+
+// ---- reflowv1.pdf / reflowv2.pdf: same sentences, different pagination ----
+// v2 repaginates (a sentence moves from page 1 to page 2), v1 hyphenates
+// "infor-mation" across lines, and exactly ONE word changes
+// (efficiency -> throughput). Every page also carries a running head and a
+// page number. The per-page views see changes everywhere; the document text
+// view must report exactly the one changed word.
+{
+  const HEAD = "REFLOW REPORT - INTERNAL";
+  const pageOf = (doc, font, lines, num) => {
+    const p = doc.addPage([612, 792]);
+    p.drawText(HEAD, { x: 72, y: 740, size: 10, font });
+    let y = 690;
+    for (const l of lines) { p.drawText(l, { x: 72, y, size: 14, font }); y -= 34; }
+    p.drawText(String(num), { x: 300, y: 60, size: 10, font });
+  };
+  {
+    const { doc, font } = await newDoc();
+    pageOf(doc, font, [
+      "The pipeline ingests raw sensor data and normalizes it",
+      "before the model consumes it for training purposes.",
+      "Careful batching improves overall efficiency of the infor-",
+      "mation processing stage in production deployments.",
+    ], 1);
+    pageOf(doc, font, [
+      "A second phase validates the outputs against golden data.",
+      "Alerts fire when drift exceeds the configured threshold.",
+    ], 2);
+    pageOf(doc, font, ["Final page content stays identical in both versions."], 3);
+    write("reflowv1.pdf", await doc.save());
+  }
+  {
+    const { doc, font } = await newDoc();
+    pageOf(doc, font, [
+      "The pipeline ingests raw sensor data and normalizes it",
+      "before the model consumes it for training purposes.",
+      "Careful batching improves overall throughput of the information",
+    ], 1);
+    pageOf(doc, font, [
+      "processing stage in production deployments.",
+      "A second phase validates the outputs against golden data.",
+    ], 2);
+    pageOf(doc, font, [
+      "Alerts fire when drift exceeds the configured threshold.",
+      "Final page content stays identical in both versions.",
+    ], 3);
+    write("reflowv2.pdf", await doc.save());
+  }
+}
+
+// ---- movev1.pdf / movev2.pdf: a paragraph relocates, nothing is edited ----
+// Paragraph order A, B, C becomes A, C, B (B also lands on a different page).
+// B is deliberately the shortest paragraph so the minimal edit is "B moved"
+// rather than "C moved". The text view must report a move, not a deletion
+// plus an insertion.
+{
+  const A = ["Alpha paragraph opens the report with the usual framing sentence.",
+             "It then restates the goal of the quarter in plain words."];
+  const B = ["Bravo paragraph holds the budget numbers that finance signed off on twice."];
+  const C = ["Charlie paragraph closes with next steps and the owner of each one.",
+             "Every owner confirmed their step before the report was circulated."];
+  const mk = async (order) => {
+    const { doc, font } = await newDoc();
+    let p = doc.addPage([612, 792]);
+    let y = 700, n = 0;
+    for (const para of order) {
+      for (const line of para) {
+        if (n === 3) { p = doc.addPage([612, 792]); y = 700; } // page break after 3 lines
+        p.drawText(line, { x: 72, y, size: 13, font });
+        y -= 34; n++;
+      }
+    }
+    return doc.save();
+  };
+  write("movev1.pdf", await mk([A, B, C]));
+  write("movev2.pdf", await mk([A, C, B]));
+}
+
+console.log("fixtures done.");

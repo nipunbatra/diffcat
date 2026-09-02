@@ -1,0 +1,10 @@
+{
+  "name": "diffcat",
+  "version": "1.0.0",
+  "description": "Compare two PDFs entirely in your browser — aligned pages, overlays, and a whole-document text diff via MuPDF WASM. Nothing leaves your device.",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://nipunbatra.github.io/diffcat/",
+  "dependencies": {
+    "mupdf": "1.28.0"
+  }
+}

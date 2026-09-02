@@ -1,0 +1,1392 @@
+// Diffcat — what changed between two PDFs (or images)?
+// Both files are rendered locally by MuPDF WASM. Pages are first ALIGNED by
+// content (an inserted cover page must not make every later page look
+// "changed"), then each aligned pair is diffed two ways: pixels (changed
+// regions, overlay tinting) and words (via the text layer, so insertions and
+// deletions are marked at exact positions). A whole-document text view diffs
+// the flowing text across pages, with relocated passages shown as moves.
+// Nothing ever leaves the tab.
+
+import { loadEngine } from "./engine.js";
+import {
+  alignPages, docTextDiff, flowDocText, jaccard, pageOverlap,
+  pixelRegions, pixelsDiffer, shingleSet, tokenDiff,
+} from "./diff.js";
+
+const $ = (id) => document.getElementById(id);
+
+const els = {
+  hero: $("hero"), facts: $("facts"), compare: $("compare"), note: $("cnote"),
+  slots: $("cslots"), samplerow: $("csamplerow"), sample: $("csample"), swap: $("cswap"),
+  slotEl: { A: $("slotA"), B: $("slotB") },
+  slotName: { A: $("slotAname"), B: $("slotBname") },
+  slotInput: { A: $("fileA"), B: $("fileB") },
+  bar: $("cbar"), names: $("cnames"), summary: $("csummary"),
+  modes: $("cmodes"), hl: $("chl"), pager: $("cpager"),
+  prev: $("cprev"), next: $("cnext"), pageinfo: $("cpageinfo"),
+  close: $("cclose"), image: $("cimage"), download: $("cdownload"),
+  views: $("cviews"), strip: $("cstrip"), doctext: $("cdoctext"),
+  rangebar: $("crangebar"), rangeapply: $("crangeapply"), rangeall: $("crangeall"),
+  rangeinfo: $("crangeinfo"),
+  rangeIn: { A: [$("rA0"), $("rA1")], B: [$("rB0"), $("rB1")] },
+  pair: $("cpair"), capA: $("capA"), capB: $("capB"), one: $("cone"),
+  cvA: $("cvA"), cvB: $("cvB"), cvO: $("cvO"),
+  status: $("cstatus"), legend: $("clegend"),
+  textwrap: $("ctextwrap"), textsummary: $("ctextsummary"), text: $("ctext"),
+  busy: $("busy"), busytext: $("busytext"),
+};
+
+// keep in sync with --del / --add / --chg in css/style.css
+const COLORS = { del: "#b3261e", add: "#0e6b52", chg: "#c77400" };
+
+const TARGET_W = 1300;        // preferred render width in px for the wider page
+const MAX_DIFF_PIXELS = 6e6;  // per-page render cap (both sides use one scale)
+const CACHE_PAGES = 6;        // full-res page pairs kept in memory
+const THUMB_W = 120;          // page-strip thumbnail width
+const MAX_THUMB_PAGES = 400;  // beyond this the strip skips thumbs & pixel scan
+const ALIGN_MAX_CELLS = 25e4; // pageCountA × pageCountB cap for alignment
+const MIN_PAGE_SIM = 0.3;     // below this, pages are add/remove, not a pair
+
+const STATUS_LABEL = {
+  same: "unchanged", changed: "changed", added: "only in new",
+  removed: "only in old", flow: "re-paginated", pending: "scanning…",
+};
+
+const S = {
+  mupdf: null,
+  opening: false,
+  A: null, B: null,        // {name, doc, pageCount, password}
+  winA: null, winB: null,  // page window per side {from, to} (0-based, inclusive); null = all
+  pairs: [],               // aligned [{a, b, flow?, found?}], absolute page index or null
+  sigA: null, sigB: null,  // sparse per-page {text, words, sh, vec?} (null on fallback)
+  pageMax: 0,              // = pairs.length
+  pageIndex: 0,            // index into pairs
+  mode: "side",            // side | overlay | swipe | text
+  userMode: null,          // a view the user picked explicitly (sticks for the session)
+  highlights: true,
+  swipeX: 0.55,
+  scan: [],                // per pair {status, thumb}
+  scanned: false,
+  scanToken: 0,
+  cache: new Map(),        // pairIndex -> entry (LRU, capped at CACHE_PAGES)
+  docDiff: null,           // whole-document text diff
+};
+
+/* ---------- helpers ---------- */
+
+function busy(text) {
+  els.busytext.textContent = text;
+  els.busy.hidden = false;
+  return new Promise((r) => setTimeout(r, 30));
+}
+function unbusy() { els.busy.hidden = true; }
+
+const tick = () => new Promise((r) => setTimeout(r));
+const baseName = (name) => name.replace(/\.[^.]+$/, "");
+
+async function ensureEngine() {
+  if (S.mupdf) return;
+  await busy("loading the PDF engine (10 MB, one time)…");
+  S.mupdf = await loadEngine();
+}
+
+function downloadBlob(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+/* ---------- lifecycle ---------- */
+
+function destroySide(side) {
+  const d = S[side];
+  if (d?.doc) { try { d.doc.destroy(); } catch {} }
+  S[side] = null;
+}
+
+function clearCache() {
+  for (const e of S.cache.values()) { try { e.overlay?.close?.(); } catch {} }
+  S.cache.clear();
+}
+
+function resetScanThumbs() {
+  for (const s of S.scan) { try { s.thumb?.close?.(); } catch {} }
+}
+
+// a new/replaced file voids every derived result
+function invalidateCompare() {
+  S.scanToken++;
+  clearCache();
+  resetScanThumbs();
+  S.scan = [];
+  S.scanned = false;
+  S.pairs = [];
+  S.sigA = S.sigB = null;
+  S.docDiff = null;
+  S.pageIndex = 0;
+  els.bar.hidden = true;
+  els.rangebar.hidden = true;
+  els.views.hidden = true;
+  els.note.hidden = true;
+}
+
+function startOver() {
+  destroySide("A");
+  destroySide("B");
+  invalidateCompare();
+  S.winA = S.winB = null;
+  S.pageMax = 0;
+  els.compare.hidden = true;
+  els.hero.hidden = false;
+  els.facts.hidden = false;
+  updateSlots();
+  window.scrollTo({ top: 0 });
+}
+
+function updateSlots() {
+  for (const side of ["A", "B"]) {
+    const d = S[side];
+    els.slotName[side].textContent = d
+      ? `${d.name} · ${d.pageCount} page${d.pageCount === 1 ? "" : "s"} · click to replace`
+      : "drop or click — pdf · png · jpeg";
+    els.slotEl[side].classList.toggle("loaded", !!d);
+  }
+  els.samplerow.hidden = !!(S.A && S.B);
+  els.swap.disabled = !(S.A && S.B);
+}
+
+/* ---------- page windows ---------- */
+
+// the page span of one side that takes part in the comparison, clamped to the file
+function windowOf(side) {
+  const d = S[side];
+  if (!d) return { from: 0, to: -1 };
+  const w = side === "A" ? S.winA : S.winB;
+  const last = d.pageCount - 1;
+  const from = Math.max(0, Math.min(last, w?.from ?? 0));
+  const to = Math.max(from, Math.min(last, w?.to ?? last));
+  return { from, to };
+}
+
+function isFullWindow(side) {
+  const w = windowOf(side);
+  return w.from === 0 && w.to === S[side].pageCount - 1;
+}
+
+function updateRangeBar() {
+  if (!S.A || !S.B) return;
+  for (const side of ["A", "B"]) {
+    const w = windowOf(side);
+    const [i0, i1] = els.rangeIn[side];
+    i0.max = i1.max = S[side].pageCount;
+    i0.value = w.from + 1;
+    i1.value = w.to + 1;
+  }
+  const a = windowOf("A"), b = windowOf("B");
+  els.rangeinfo.textContent = isFullWindow("A") && isFullWindow("B")
+    ? "all pages"
+    : `comparing old ${a.from + 1}–${a.to + 1} with new ${b.from + 1}–${b.to + 1}`;
+  els.rangeall.disabled = isFullWindow("A") && isFullWindow("B");
+}
+
+async function applyRange() {
+  if (!S.A || !S.B || S.opening) return;
+  const read = (side) => {
+    const [i0, i1] = els.rangeIn[side];
+    const last = S[side].pageCount;
+    const from = Math.max(1, Math.min(last, parseInt(i0.value, 10) || 1));
+    const to = Math.max(from, Math.min(last, parseInt(i1.value, 10) || last));
+    return { from: from - 1, to: to - 1 };
+  };
+  S.winA = read("A");
+  S.winB = read("B");
+  invalidateCompare();
+  await beginCompare();
+}
+
+/* ---------- opening files ---------- */
+
+async function openSideFile(side, file) {
+  const name = file.name || "untitled";
+  const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(name);
+  const type = isPdf ? "application/pdf" : (file.type || "image/png");
+  await openSideBytes(side, name, new Uint8Array(await file.arrayBuffer()), type);
+}
+
+async function openSideBytes(side, name, bytes, type = "application/pdf") {
+  if (S.opening) return;
+  S.opening = true;
+  try {
+    await ensureEngine();
+    await busy(`opening the ${side === "A" ? "old" : "new"} file…`);
+    const doc = S.mupdf.Document.openDocument(bytes, type);
+    let password = null, pageCount;
+    // every fallible step runs before the old side is torn down
+    try {
+      if (doc.needsPassword()) {
+        unbusy();
+        for (let attempt = 0; ; attempt++) {
+          if (attempt >= 3) throw new Error("Wrong password (3 attempts).");
+          const pw = window.prompt(attempt === 0
+            ? `“${name}” is password-protected. Enter the password to open it:`
+            : "Wrong password — try again:");
+          if (pw === null) throw new Error("A password is required to open this file.");
+          if (doc.authenticatePassword(pw) !== 0) { password = pw; break; }
+        }
+        await busy("opening…");
+      }
+      pageCount = doc.countPages();
+      if (pageCount === 0) throw new Error("This file has no pages.");
+      doc.loadPage(0).getBounds(); // fail early on broken page trees
+    } catch (err) {
+      try { doc.destroy(); } catch {}
+      throw err;
+    }
+    destroySide(side);
+    S[side] = { name, doc, pageCount, password };
+    if (side === "A") S.winA = null; else S.winB = null; // a new file compares whole
+    invalidateCompare();
+    updateSlots();
+    unbusy();
+    if (S.A && S.B) await beginCompare();
+  } catch (err) {
+    unbusy();
+    alert(`Couldn't open that file.\n\n${err.message || err}`);
+  } finally {
+    S.opening = false;
+  }
+}
+
+async function openPair(fileA, fileB) {
+  await openSideFile("A", fileA);
+  await openSideFile("B", fileB);
+}
+
+/* ---------- page alignment ---------- */
+
+async function rasterBitmap(doc, i, scale) {
+  const pix = doc.loadPage(i).toPixmap(
+    S.mupdf.Matrix.scale(scale, scale),
+    S.mupdf.ColorSpace.DeviceRGB, false, true,
+  );
+  const png = pix.asPNG();
+  pix.destroy();
+  return createImageBitmap(new Blob([png], { type: "image/png" }));
+}
+
+function pageDims(doc, i) {
+  const b = doc.loadPage(i).getBounds();
+  return { bounds: b, pw: Math.max(1, b[2] - b[0]), ph: Math.max(1, b[3] - b[1]) };
+}
+
+function pageTextRaw(doc, i) {
+  const st = doc.loadPage(i).toStructuredText();
+  const t = st.asText();
+  st.destroy();
+  return t;
+}
+
+// tiny stretched grayscale grid — lets textless (scanned) pages align
+async function microVec(doc, i) {
+  const GW = 16, GH = 20;
+  const d = pageDims(doc, i);
+  const bm = await rasterBitmap(doc, i, Math.min(1, Math.max(GW / d.pw, GH / d.ph)));
+  const c = document.createElement("canvas");
+  c.width = GW; c.height = GH;
+  const g = c.getContext("2d");
+  g.fillStyle = "#ffffff";
+  g.fillRect(0, 0, GW, GH);
+  g.drawImage(bm, 0, 0, GW, GH);
+  bm.close?.();
+  const px = g.getImageData(0, 0, GW, GH).data;
+  const v = new Float32Array(GW * GH);
+  for (let p = 0; p < v.length; p++) {
+    v[p] = (px[p * 4] * 77 + px[p * 4 + 1] * 150 + px[p * 4 + 2] * 29) >> 8;
+  }
+  return v;
+}
+
+function rasterSim(a, b) {
+  if (!a || !b) return 0;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return 1 - s / (a.length * 255);
+}
+
+// sparse array indexed by absolute page number, filled for pages from..to
+async function docSignatures(doc, from, to) {
+  const sigs = [];
+  for (let i = from; i <= to; i++) {
+    let text = "";
+    try { text = pageTextRaw(doc, i); } catch {}
+    const words = text.split(/\s+/).filter(Boolean);
+    const sig = { text, words: words.length, sh: shingleSet(words), vec: null };
+    if (!words.length) {
+      try { sig.vec = await microVec(doc, i); } catch {}
+    }
+    sigs[i] = sig;
+    if ((i & 7) === 7) await tick();
+  }
+  return sigs;
+}
+
+// raw text of every page in a side's window, in order
+function windowPageTexts(side) {
+  const d = S[side];
+  const sigs = side === "A" ? S.sigA : S.sigB;
+  const w = windowOf(side);
+  const out = [];
+  for (let i = w.from; i <= w.to; i++) {
+    let t = sigs?.[i]?.text;
+    if (t == null) { try { t = pageTextRaw(d.doc, i); } catch { t = ""; } }
+    out.push(t);
+  }
+  return out;
+}
+
+function computeDocDiff() {
+  const ta = flowDocText(windowPageTexts("A"));
+  const tb = flowDocText(windowPageTexts("B"));
+  S.docDiff = !ta && !tb ? { empty: true } : docTextDiff(ta, tb);
+}
+
+async function buildAlignment() {
+  const wa = windowOf("A"), wb = windowOf("B");
+  const N = wa.to - wa.from + 1, M = wb.to - wb.from + 1;
+  // a single page on each side was chosen to be compared — always pair them
+  if (N === 1 && M === 1) {
+    S.pairs = [{ a: wa.from, b: wb.from }];
+    S.sigA = S.sigB = null;
+    return;
+  }
+  if (N * M > ALIGN_MAX_CELLS) {
+    // enormous documents: fall back to index pairing
+    S.pairs = Array.from({ length: Math.max(N, M) }, (_, i) => ({
+      a: i < N ? wa.from + i : null,
+      b: i < M ? wb.from + i : null,
+    }));
+    S.sigA = S.sigB = null;
+    return;
+  }
+  await busy("aligning pages…");
+  S.sigA = await docSignatures(S.A.doc, wa.from, wa.to);
+  S.sigB = await docSignatures(S.B.doc, wb.from, wb.to);
+
+  // The whole-document text diff (also what the text view shows) decides
+  // which pages correspond: page i pairs with the page that holds the words
+  // the diff aligned as unchanged. Pages with no flowing text fall back to
+  // word-bag similarity if they have a few words, or to pixels if they have none.
+  const flowA = flowDocText(windowPageTexts("A"), true);
+  const flowB = flowDocText(windowPageTexts("B"), true);
+  S.docDiff = !flowA.text && !flowB.text ? { empty: true } : docTextDiff(flowA.text, flowB.text);
+  const ov = S.docDiff.ops ? pageOverlap(S.docDiff.ops, flowA.pageOf, flowB.pageOf, N, M) : null;
+  // words of each page that the diff aligned anywhere (deleted text, e.g. an
+  // abstract that moved off the page, must not count against its page)
+  const alignedA = new Float32Array(N), alignedB = new Float32Array(M);
+  if (ov) {
+    for (let i = 0; i < N; i++) {
+      for (let j = 0; j < M; j++) { alignedA[i] += ov.counts[i * M + j]; alignedB[j] += ov.counts[i * M + j]; }
+    }
+  }
+  const sim = (i, j) => {
+    const a = S.sigA[wa.from + i], b = S.sigB[wb.from + j];
+    if (!a.words && !b.words) return rasterSim(a.vec, b.vec);
+    if (!a.words || !b.words) return 0.15; // one page has text, the other doesn't — no plausible pair
+    let s = jaccard(a.sh, b.sh);
+    if (ov) {
+      const c = ov.counts[i * M + j];
+      if (c > 0) {
+        // share of each page's aligned words that landed on the other page,
+        // discounted when the shared run is too short to be conclusive
+        const frac = Math.min(c / alignedA[i], c / alignedB[j]);
+        s = Math.max(s, frac * Math.min(1, c / 40));
+      }
+    }
+    return s;
+  };
+  const grid = new Float32Array(N * M);
+  for (let i = 0; i < N; i++) for (let j = 0; j < M; j++) grid[i * M + j] = sim(i, j);
+  S.pairs = alignPages(N, M, (i, j) => grid[i * M + j], MIN_PAGE_SIM).map((p) => ({
+    a: p.a == null ? null : p.a + wa.from,
+    b: p.b == null ? null : p.b + wb.from,
+  }));
+  if (!ov) return;
+
+  // A page left unmatched whose text mostly lives on ONE page of the other
+  // side was merged into / split off from that page by re-pagination — not
+  // added or removed. Pair it with that page and flag the pair ("flow") so
+  // the UI can say so. Pages whose text is genuinely absent keep their
+  // status but remember where the little that matched went.
+  for (const p of S.pairs) {
+    if (p.a != null && p.b == null) {
+      const i = p.a - wa.from;
+      let bj = -1, bc = 0;
+      for (let j = 0; j < M; j++) if (ov.counts[i * M + j] > bc) { bc = ov.counts[i * M + j]; bj = j; }
+      if (bc > 0) {
+        p.found = { page: bj + wb.from, pct: Math.round(100 * alignedA[i] / Math.max(1, ov.wordsA[i])) };
+        if (alignedA[i] >= 20 && alignedA[i] >= 0.5 * ov.wordsA[i]) { p.b = bj + wb.from; p.flow = "into"; }
+      }
+    } else if (p.a == null && p.b != null) {
+      const j = p.b - wb.from;
+      let bi = -1, bc = 0;
+      for (let i = 0; i < N; i++) if (ov.counts[i * M + j] > bc) { bc = ov.counts[i * M + j]; bi = i; }
+      if (bc > 0) {
+        p.found = { page: bi + wa.from, pct: Math.round(100 * alignedB[j] / Math.max(1, ov.wordsB[j])) };
+        if (alignedB[j] >= 20 && alignedB[j] >= 0.5 * ov.wordsB[j]) { p.a = bi + wa.from; p.flow = "from"; }
+      }
+    }
+  }
+}
+
+/* ---------- compare pipeline ---------- */
+
+async function beginCompare() {
+  await busy("comparing…");
+  try {
+    await buildAlignment();
+  } catch (err) {
+    unbusy();
+    alert(`Couldn't align the two files.\n\n${err.message || err}`);
+    return;
+  }
+  unbusy();
+  S.pageMax = S.pairs.length;
+  S.pageIndex = 0;
+  els.hero.hidden = true;
+  els.facts.hidden = true;
+  els.compare.hidden = false;
+  els.bar.hidden = false;
+  els.rangebar.hidden = false;
+  updateRangeBar();
+  els.views.hidden = false;
+  els.names.textContent = `${S.A.name} ⇄ ${S.B.name}`;
+  els.names.title = els.names.textContent;
+  S.scan = S.pairs.map(() => ({ status: "pending", thumb: null }));
+  buildStrip();
+  updateSummary();
+  await cGotoPage(0, true);
+  // pick the view: what the user chose earlier in this session, else the
+  // text view for re-typeset pairs (pixels differ everywhere by construction),
+  // else side by side
+  const retypeset = S.pairs.some((p) => p.flow);
+  await setMode(S.userMode ?? (retypeset ? "text" : "side"));
+  const autoText = !S.userMode && retypeset;
+  els.note.textContent = autoText
+    ? "these files were re-typeset (pages merged or split), so pixel views would differ everywhere — showing the text view. The page views are one click away."
+    : "";
+  els.note.hidden = !autoText;
+  scanAll(); // async background sweep; guards itself with scanToken
+}
+
+// Render the pages of pair i at one shared points→pixels scale onto white
+// union-size canvases, then derive everything the views need: changed
+// regions, the tinted overlay, and the word-level text diff.
+async function ensurePage(i) {
+  if (S.cache.has(i)) {
+    const e = S.cache.get(i);
+    S.cache.delete(i);
+    S.cache.set(i, e); // refresh LRU order
+    return e;
+  }
+  const { a: pa, b: pb } = S.pairs[i];
+  const dimA = pa != null ? pageDims(S.A.doc, pa) : null;
+  const dimB = pb != null ? pageDims(S.B.doc, pb) : null;
+  const pw = Math.max(dimA?.pw ?? 1, dimB?.pw ?? 1);
+  const ph = Math.max(dimA?.ph ?? 1, dimB?.ph ?? 1);
+  let scale = Math.min(2.5, Math.max(0.5, TARGET_W / pw));
+  scale = Math.min(scale, Math.sqrt(MAX_DIFF_PIXELS / (pw * ph)));
+  scale = Math.max(scale, 8 / Math.min(pw, ph)); // never a zero-pixel render
+  const w = Math.max(1, Math.ceil(pw * scale));
+  const h = Math.max(1, Math.ceil(ph * scale));
+
+  const renderSide = async (doc, p) => {
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const g = c.getContext("2d");
+    g.fillStyle = "#ffffff";
+    g.fillRect(0, 0, w, h);
+    if (p != null) {
+      const bm = await rasterBitmap(doc, p, scale);
+      g.drawImage(bm, 0, 0);
+      bm.close?.();
+    }
+    return c;
+  };
+  const cA = await renderSide(S.A?.doc, pa);
+  const cB = await renderSide(S.B?.doc, pb);
+
+  const dA = cA.getContext("2d").getImageData(0, 0, w, h);
+  const dB = cB.getContext("2d").getImageData(0, 0, w, h);
+  const regions = pa != null && pb != null ? pixelRegions(dA.data, dB.data, w, h) : [];
+
+  // overlay: red = ink only in old, teal = ink only in new, dark = both
+  const od = new ImageData(w, h);
+  const a8 = dA.data, b8 = dB.data, o8 = od.data;
+  for (let p = 0; p < a8.length; p += 4) {
+    const la = (a8[p] * 77 + a8[p + 1] * 150 + a8[p + 2] * 29) >> 8;
+    const lb = (b8[p] * 77 + b8[p + 1] * 150 + b8[p + 2] * 29) >> 8;
+    o8[p] = lb;         // old ink knocks out red's complement -> shows red
+    o8[p + 1] = la;     // new ink shows as teal/cyan
+    o8[p + 2] = la;
+    o8[p + 3] = 255;
+  }
+  const overlay = await createImageBitmap(od);
+
+  const text = computeTextDiff(pa, pb, scale, dimA?.bounds, dimB?.bounds);
+
+  const entry = { w, h, scale, cA, cB, pa, pb, regions, overlay, text };
+  S.cache.set(i, entry);
+  if (S.cache.size > CACHE_PAGES) {
+    const [oldKey, oldEntry] = S.cache.entries().next().value;
+    try { oldEntry.overlay?.close?.(); } catch {}
+    S.cache.delete(oldKey);
+  }
+  return entry;
+}
+
+/* ---------- per-page text diff ---------- */
+
+// words with united character quads, in fitz page coordinates
+function pageWords(doc, i) {
+  const st = doc.loadPage(i).toStructuredText();
+  const words = [];
+  let cur = null;
+  const flush = () => { if (cur && cur.s) words.push(cur); cur = null; };
+  st.walk({
+    endLine: flush,
+    onChar(c, _origin, _font, _size, q) {
+      if (/\s/.test(c)) { flush(); return; }
+      const x0 = Math.min(q[0], q[2], q[4], q[6]);
+      const x1 = Math.max(q[0], q[2], q[4], q[6]);
+      const y0 = Math.min(q[1], q[3], q[5], q[7]);
+      const y1 = Math.max(q[1], q[3], q[5], q[7]);
+      if (!cur) cur = { s: "", x0, y0, x1, y1 };
+      cur.s += c;
+      if (x0 < cur.x0) cur.x0 = x0;
+      if (y0 < cur.y0) cur.y0 = y0;
+      if (x1 > cur.x1) cur.x1 = x1;
+      if (y1 > cur.y1) cur.y1 = y1;
+    },
+  });
+  flush();
+  st.destroy();
+  return words;
+}
+
+function computeTextDiff(pa, pb, scale, bndA, bndB) {
+  const empty = { none: true, delCount: 0, insCount: 0, delRects: [], insRects: [] };
+  let wordsA = [], wordsB = [];
+  try {
+    wordsA = pa != null ? pageWords(S.A.doc, pa) : [];
+    wordsB = pb != null ? pageWords(S.B.doc, pb) : [];
+  } catch {
+    return empty;
+  }
+  if (!wordsA.length && !wordsB.length) return empty;
+  const ops = tokenDiff(wordsA.map((w) => w.s), wordsB.map((w) => w.s));
+  const out = { wordsA, wordsB, ops, delRects: [], insRects: [], delCount: 0, insCount: 0 };
+  if (!ops) { out.overflow = true; return out; }
+  const rect = (wd, bnd) => ({
+    x: (wd.x0 - bnd[0]) * scale - 1,
+    y: (wd.y0 - bnd[1]) * scale - 1,
+    w: (wd.x1 - wd.x0) * scale + 2,
+    h: (wd.y1 - wd.y0) * scale + 2,
+  });
+  for (const o of ops) {
+    if (o.t === "-") {
+      out.delCount += o.n;
+      for (let k = 0; k < o.n; k++) out.delRects.push(rect(wordsA[o.ai + k], bndA));
+    } else if (o.t === "+") {
+      out.insCount += o.n;
+      for (let k = 0; k < o.n; k++) out.insRects.push(rect(wordsB[o.bi + k], bndB));
+    }
+  }
+  return out;
+}
+
+/* ---------- background pair scan (strip statuses + thumbnails) ---------- */
+
+async function scanAll() {
+  const token = ++S.scanToken;
+  const withThumbs = S.pageMax <= MAX_THUMB_PAGES;
+  els.strip.classList.toggle("nothumbs", !withThumbs);
+  for (let i = 0; i < S.pageMax; i++) {
+    if (token !== S.scanToken) return;
+    let status = "same", thumb = null;
+    try {
+      const { a: pa, b: pb, flow } = S.pairs[i];
+      if (flow) status = "flow";
+      else if (pa == null) status = "added";
+      else if (pb == null) status = "removed";
+      else {
+        const tA = S.sigA ? S.sigA[pa].text : pageTextRaw(S.A.doc, pa);
+        const tB = S.sigB ? S.sigB[pb].text : pageTextRaw(S.B.doc, pb);
+        if (tA !== tB) status = "changed";
+      }
+
+      if (withThumbs) {
+        if (pa != null && pb != null) {
+          // one shared scale, so the thumbnail pixel check is a fair comparison
+          const a = pageDims(S.A.doc, pa), b = pageDims(S.B.doc, pb);
+          const ts = Math.min(1, THUMB_W / Math.max(a.pw, b.pw));
+          const tw = Math.max(1, Math.ceil(Math.max(a.pw, b.pw) * ts));
+          const th = Math.max(1, Math.ceil(Math.max(a.ph, b.ph) * ts));
+          const bmA = await rasterBitmap(S.A.doc, pa, ts);
+          const bmB = await rasterBitmap(S.B.doc, pb, ts);
+          if (token !== S.scanToken) { bmA.close?.(); bmB.close?.(); return; }
+          if (status === "same") {
+            const flat = (bm) => {
+              const c = document.createElement("canvas");
+              c.width = tw; c.height = th;
+              const g = c.getContext("2d");
+              g.fillStyle = "#ffffff";
+              g.fillRect(0, 0, tw, th);
+              g.drawImage(bm, 0, 0);
+              return g.getImageData(0, 0, tw, th).data;
+            };
+            // catches graphics/image changes the text comparison can't see
+            if (pixelsDiffer(flat(bmA), flat(bmB))) status = "changed";
+          }
+          thumb = bmB;
+          bmA.close?.();
+        } else {
+          const src = pb != null ? S.B : S.A;
+          const p = pb ?? pa;
+          const d = pageDims(src.doc, p);
+          thumb = await rasterBitmap(src.doc, p, Math.min(1, THUMB_W / d.pw));
+          if (token !== S.scanToken) { thumb.close?.(); return; }
+        }
+      }
+    } catch {
+      status = "changed"; // a page that won't scan deserves a look
+    }
+    S.scan[i] = { status, thumb };
+    updateStripCell(i);
+    updateSummary();
+    if ((i & 1) === 1) await tick(); // let the UI breathe
+  }
+  S.scanned = true;
+  updateSummary();
+}
+
+/* ---------- page strip ---------- */
+
+function pairShort(p) {
+  if (p.flow) return `${p.a + 1}↝${p.b + 1}`;
+  if (p.a == null) return `+${p.b + 1}`;
+  if (p.b == null) return `−${p.a + 1}`;
+  return p.a === p.b ? `${p.a + 1}` : `${p.a + 1}→${p.b + 1}`;
+}
+
+function pairLong(p) {
+  if (p.flow === "into") return `old p${p.a + 1} ↝ new p${p.b + 1} (merged into it)`;
+  if (p.flow === "from") return `old p${p.a + 1} ↝ new p${p.b + 1} (split off from it)`;
+  if (p.a == null) return `new page ${p.b + 1}`;
+  if (p.b == null) return `old page ${p.a + 1}`;
+  return p.a === p.b ? `page ${p.a + 1}` : `old p${p.a + 1} ↔ new p${p.b + 1}`;
+}
+
+function buildStrip() {
+  els.strip.replaceChildren();
+  for (let i = 0; i < S.pageMax; i++) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "pcell s-pending";
+    if (S.pageMax <= MAX_THUMB_PAGES) {
+      const c = document.createElement("canvas");
+      c.className = "pthumb";
+      c.width = 3; c.height = 4;
+      b.appendChild(c);
+    }
+    const n = document.createElement("span");
+    n.className = "pnum";
+    n.textContent = pairShort(S.pairs[i]);
+    b.appendChild(n);
+    b.title = pairLong(S.pairs[i]);
+    b.addEventListener("click", () => cGotoPage(i));
+    els.strip.appendChild(b);
+  }
+  markStripCurrent();
+}
+
+function updateStripCell(i) {
+  const b = els.strip.children[i];
+  if (!b) return;
+  const s = S.scan[i];
+  b.classList.remove("s-same", "s-changed", "s-added", "s-removed", "s-flow", "s-pending");
+  b.classList.add(`s-${s.status}`);
+  b.title = `${pairLong(S.pairs[i])} — ${STATUS_LABEL[s.status]}`;
+  const c = b.querySelector(".pthumb");
+  if (c && s.thumb) {
+    c.width = s.thumb.width;
+    c.height = s.thumb.height;
+    c.getContext("2d").drawImage(s.thumb, 0, 0);
+  }
+}
+
+function markStripCurrent() {
+  for (let i = 0; i < els.strip.children.length; i++) {
+    els.strip.children[i].classList.toggle("current", i === S.pageIndex);
+  }
+  els.strip.children[S.pageIndex]?.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+/* ---------- navigation & drawing ---------- */
+
+async function cGotoPage(i, force = false) {
+  if (i < 0 || i >= S.pageMax) return;
+  if (!force && i === S.pageIndex && S.cache.has(i)) { markStripCurrent(); return; }
+  S.pageIndex = i;
+  let e = S.cache.get(i);
+  if (!e) {
+    await busy(`comparing ${pairLong(S.pairs[i])}…`);
+    try {
+      e = await ensurePage(i);
+    } catch (err) {
+      unbusy();
+      alert(`Couldn't compare ${pairLong(S.pairs[i])}.\n\n${err.message || err}`);
+      return;
+    }
+    unbusy();
+    // the full-res result can catch changes the quick scan missed
+    const s = S.scan[i];
+    if (s && s.status === "same" && (e.regions.length || e.text.delCount || e.text.insCount)) {
+      s.status = "changed";
+      updateStripCell(i);
+      updateSummary();
+    }
+  }
+  els.capA.textContent = `${S.A.name}${e.pa != null ? ` · page ${e.pa + 1}` : ""}`;
+  els.capB.textContent = `${S.B.name}${e.pb != null ? ` · page ${e.pb + 1}` : ""}`;
+  updatePager();
+  drawViews();
+  updateStatus();
+  buildTextPanel(e);
+  markStripCurrent();
+}
+
+function updatePager() {
+  els.pageinfo.textContent = `${S.pageIndex + 1} / ${S.pageMax}`;
+  els.prev.disabled = S.pageIndex === 0;
+  els.next.disabled = S.pageIndex === S.pageMax - 1;
+}
+
+function drawViews() {
+  if (S.mode === "text") return; // the text view has no canvases
+  const e = S.cache.get(S.pageIndex);
+  if (!e) return;
+  const side = S.mode === "side";
+  els.pair.hidden = !side;
+  els.one.hidden = side;
+  if (side) {
+    paintSide(els.cvA, e, "A");
+    paintSide(els.cvB, e, "B");
+  } else {
+    els.cvO.width = e.w;
+    els.cvO.height = e.h;
+    const g = els.cvO.getContext("2d");
+    if (S.mode === "overlay") {
+      g.drawImage(e.overlay, 0, 0);
+      paintRegions(g, e);
+    } else {
+      // swipe: new underneath, old clipped to the left of the divider
+      g.drawImage(e.cB, 0, 0);
+      const cut = Math.round(e.w * S.swipeX);
+      g.save();
+      g.beginPath();
+      g.rect(0, 0, cut, e.h);
+      g.clip();
+      g.drawImage(e.cA, 0, 0);
+      g.restore();
+      g.save();
+      g.fillStyle = "#141412";
+      g.fillRect(cut - 1, 0, 3, e.h);
+      const fs = Math.max(11, Math.round(e.w / 70));
+      g.font = `700 ${fs}px ui-monospace, Menlo, monospace`;
+      g.textBaseline = "top";
+      const padx = Math.round(fs * 0.45);
+      const tag = (label, x, align) => {
+        const tw = g.measureText(label).width + padx * 2;
+        const tx = align === "right" ? x - tw : x;
+        g.fillStyle = "#141412";
+        g.fillRect(tx, 8, tw, fs * 1.7);
+        g.fillStyle = "#ffffff";
+        g.fillText(label, tx + padx, 8 + fs * 0.33);
+      };
+      tag("old", cut - 8, "right");
+      tag("new", cut + 8, "left");
+      g.restore();
+    }
+    els.cvO.style.cursor = S.mode === "swipe" ? "col-resize" : "default";
+  }
+  updateLegend();
+}
+
+function paintSide(cv, e, side) {
+  cv.width = e.w;
+  cv.height = e.h;
+  const g = cv.getContext("2d");
+  g.drawImage(side === "A" ? e.cA : e.cB, 0, 0);
+  const missing = side === "A" ? e.pa == null : e.pb == null;
+  if (missing) {
+    g.fillStyle = "#8a8a84";
+    g.font = `${Math.max(12, Math.round(e.w / 32))}px ui-monospace, Menlo, monospace`;
+    g.textAlign = "center";
+    g.fillText(side === "A" ? "no matching page in the old file" : "no matching page in the new file", e.w / 2, e.h / 2);
+  }
+  if (!S.highlights) return;
+  paintRegions(g, e);
+  g.save();
+  g.globalAlpha = 0.3;
+  g.fillStyle = side === "A" ? COLORS.del : COLORS.add;
+  for (const r of side === "A" ? e.text.delRects : e.text.insRects) {
+    g.fillRect(r.x, r.y, r.w, r.h);
+  }
+  g.restore();
+}
+
+function paintRegions(g, e) {
+  if (!S.highlights || !e.regions.length) return;
+  g.save();
+  g.strokeStyle = COLORS.chg;
+  g.lineWidth = Math.max(1.5, e.w / 800);
+  g.setLineDash([7, 5]);
+  for (const r of e.regions) g.strokeRect(r.x + 0.5, r.y + 0.5, r.w, r.h);
+  g.restore();
+}
+
+/* ---------- whole-document text view ---------- */
+
+async function setMode(mode) {
+  S.mode = mode;
+  for (const b of els.modes.querySelectorAll(".tool")) {
+    const on = b.dataset.mode === mode;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+  }
+  const isText = mode === "text";
+  els.strip.hidden = isText;
+  els.pager.hidden = isText;
+  els.hl.hidden = isText;
+  els.image.hidden = isText;
+  els.textwrap.hidden = isText;
+  els.doctext.hidden = !isText;
+  if (isText) {
+    els.pair.hidden = true;
+    els.one.hidden = true;
+    await ensureDocDiff();
+  } else {
+    drawViews();
+  }
+  updateStatus();
+  updateLegend();
+}
+
+// usually already computed by buildAlignment; the single-page and huge-document
+// fallbacks skip alignment, so build it here on first use
+async function ensureDocDiff() {
+  if (!S.docDiff) {
+    await busy("reading both documents…");
+    try { computeDocDiff(); } finally { unbusy(); }
+  }
+  renderDocDiff();
+}
+
+function renderDocDiff() {
+  const d = S.docDiff;
+  els.doctext.replaceChildren();
+  if (!d) return;
+  const span = (cls, s) => {
+    const el = document.createElement("span");
+    if (cls) el.className = cls;
+    el.textContent = s;
+    return el;
+  };
+  if (d.empty) {
+    els.doctext.appendChild(span("tmuted", "no text layer in either file — use the page views instead."));
+    return;
+  }
+  if (!d.delCount && !d.insCount) {
+    els.doctext.appendChild(span("tmuted", d.movedCount
+      ? `no text edits — ${d.movedCount} words only moved (shown dotted below); page furniture is ignored. `
+      : "no text differences — after ignoring page furniture (headers, page numbers, hyphenation), the documents read identically."));
+    if (!d.movedCount) return;
+  }
+  const CONTEXT = 25, FOLD_MIN = 60;
+  for (const o of d.ops) {
+    if (o.t === "=") {
+      if (o.words.length > FOLD_MIN) {
+        els.doctext.appendChild(span("", o.words.slice(0, CONTEXT).join(" ") + " "));
+        const hidden = o.words.slice(CONTEXT, o.words.length - CONTEXT);
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "tfold";
+        btn.textContent = `⋯ ${hidden.length} unchanged words ⋯`;
+        btn.title = "show the unchanged text";
+        btn.addEventListener("click", () => btn.replaceWith(span("", hidden.join(" ") + " ")));
+        els.doctext.appendChild(btn);
+        els.doctext.appendChild(span("", " " + o.words.slice(-CONTEXT).join(" ") + " "));
+      } else {
+        els.doctext.appendChild(span("", o.words.join(" ") + " "));
+      }
+    } else if (o.t === "-") {
+      els.doctext.appendChild(span("tdel", o.words.join(" ")));
+      els.doctext.appendChild(span("", " "));
+    } else if (o.t === "+") {
+      els.doctext.appendChild(span("tins", o.words.join(" ")));
+      els.doctext.appendChild(span("", " "));
+    } else {
+      // relocated passage — identical text, different place
+      const el = span("tmov", o.words.join(" "));
+      el.title = o.t === "<" ? "moved away from here (text unchanged)" : "moved here (text unchanged)";
+      els.doctext.appendChild(el);
+      els.doctext.appendChild(span("", " "));
+    }
+  }
+}
+
+/* ---------- status, summary, legend, text panel ---------- */
+
+function updateStatus() {
+  if (S.mode === "text") {
+    const d = S.docDiff;
+    const moved = d?.movedCount ? ` · ${d.movedCount} words moved` : "";
+    els.status.textContent = !d ? ""
+      : d.empty ? "no text layer in either file"
+      : !d.delCount && !d.insCount ? `whole document · no text differences${moved}`
+      : `whole document · −${d.delCount} +${d.insCount} words${moved}`;
+    return;
+  }
+  const e = S.cache.get(S.pageIndex);
+  if (!e) { els.status.textContent = ""; return; }
+  const bits = [];
+  const p = S.pairs[S.pageIndex];
+  const where = p.found ? ` (${p.found.pct}% of its words appear on ${e.pa == null ? "old" : "new"} page ${p.found.page + 1})` : "";
+  if (p.flow) bits.push(pairLong(p));
+  else if (p.a != null && p.b != null && p.a !== p.b) bits.push(pairLong(p));
+  if (e.pa == null) bits.push(`this page exists only in the new file${where}`);
+  else if (e.pb == null) bits.push(`this page exists only in the old file${where}`);
+  else if (!e.regions.length && !e.text.delCount && !e.text.insCount && !e.text.overflow) {
+    bits.push("no differences on this page");
+  } else {
+    if (e.regions.length) bits.push(`${e.regions.length} changed region${e.regions.length === 1 ? "" : "s"}`);
+    if (e.text.overflow) bits.push("text rewritten (too much to align word-by-word)");
+    else if (e.text.delCount || e.text.insCount) bits.push(`−${e.text.delCount} +${e.text.insCount} words`);
+  }
+  els.status.textContent = bits.join(" · ");
+}
+
+function updateSummary() {
+  if (!S.scan.length) { els.summary.textContent = ""; return; }
+  const done = S.scan.filter((s) => s.status !== "pending").length;
+  const diff = S.scan.filter((s) => s.status !== "pending" && s.status !== "same").length;
+  const realigned = S.pairs.some((p) => p.a != null && p.b != null && p.a !== p.b);
+  let text = done < S.scan.length
+    ? `scanning… ${done} / ${S.scan.length}${diff ? ` · ${diff} differ so far` : ""}`
+    : diff === 0
+      ? "no differences found — the files render identically"
+      : `${diff} of ${S.scan.length} page${S.scan.length === 1 ? "" : "s"} differ${diff === 1 ? "s" : ""}`;
+  if (realigned && done === S.scan.length) text += " · pages realigned";
+  if (done === S.scan.length && S.pairs.some((p) => p.flow)) text += " · re-typeset";
+  const d = S.docDiff;
+  if (d && !d.empty && done === S.scan.length) {
+    text += ` · text −${d.delCount} +${d.insCount}${d.movedCount ? `, ${d.movedCount} moved` : ""}`;
+  }
+  els.summary.textContent = text;
+}
+
+function legendItem(swatchClass, label) {
+  const item = document.createElement("span");
+  item.className = "legend-item";
+  const sw = document.createElement("span");
+  sw.className = `swatch ${swatchClass}`;
+  item.appendChild(sw);
+  item.appendChild(document.createTextNode(label));
+  return item;
+}
+
+function updateLegend() {
+  els.legend.replaceChildren();
+  if (S.mode === "text") {
+    els.legend.appendChild(legendItem("sdel", "removed"));
+    els.legend.appendChild(legendItem("sins", "added"));
+    els.legend.appendChild(legendItem("smov", "moved"));
+    els.legend.appendChild(document.createTextNode(" headers, page numbers & hyphenation ignored"));
+    return;
+  }
+  if (S.mode === "swipe") {
+    els.legend.textContent = "drag the divider — old on the left, new on the right";
+    return;
+  }
+  if (S.mode === "overlay") {
+    els.legend.appendChild(legendItem("sdel", "ink only in old (removed)"));
+    els.legend.appendChild(legendItem("sins", "ink only in new (added)"));
+    els.legend.appendChild(document.createTextNode(" dark = unchanged"));
+    return;
+  }
+  els.legend.appendChild(legendItem("sdel", "removed words"));
+  els.legend.appendChild(legendItem("sins", "added words"));
+  els.legend.appendChild(legendItem("schg", "changed region"));
+}
+
+function buildTextPanel(e) {
+  const t = e.text;
+  els.text.replaceChildren();
+  const span = (cls, s) => {
+    const el = document.createElement("span");
+    if (cls) el.className = cls;
+    el.textContent = s;
+    return el;
+  };
+  els.textsummary.textContent = t.delCount || t.insCount
+    ? `text changes on this page (−${t.delCount} +${t.insCount} words)`
+    : "text changes on this page";
+  if (t.none) {
+    els.text.appendChild(span("tmuted", "no text layer on this page — pixel comparison only."));
+    return;
+  }
+  if (t.overflow) {
+    els.text.appendChild(span("tmuted", "the text differs too much to align word-by-word."));
+    return;
+  }
+  if (!t.delCount && !t.insCount) {
+    els.text.appendChild(span("tmuted", "no text changes on this page."));
+    return;
+  }
+  const CONTEXT = 6;
+  for (const o of t.ops) {
+    if (o.t === "=") {
+      const words = t.wordsB.slice(o.bi, o.bi + o.n).map((w) => w.s);
+      if (words.length > CONTEXT * 2 + 4) {
+        els.text.appendChild(span("", words.slice(0, CONTEXT).join(" ") + " "));
+        els.text.appendChild(span("tmuted", `⋯ ${words.length - CONTEXT * 2} unchanged words ⋯`));
+        els.text.appendChild(span("", " " + words.slice(-CONTEXT).join(" ") + " "));
+      } else {
+        els.text.appendChild(span("", words.join(" ") + " "));
+      }
+    } else if (o.t === "-") {
+      els.text.appendChild(span("tdel", t.wordsA.slice(o.ai, o.ai + o.n).map((w) => w.s).join(" ")));
+      els.text.appendChild(span("", " "));
+    } else {
+      els.text.appendChild(span("tins", t.wordsB.slice(o.bi, o.bi + o.n).map((w) => w.s).join(" ")));
+      els.text.appendChild(span("", " "));
+    }
+  }
+}
+
+/* ---------- report (self-contained HTML, printable) ---------- */
+
+function buildReport() {
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const d = S.docDiff;
+  const wa = windowOf("A"), wb = windowOf("B");
+  const counts = {};
+  for (const s of S.scan) counts[s.status] = (counts[s.status] || 0) + 1;
+  const scope = isFullWindow("A") && isFullWindow("B")
+    ? "all pages"
+    : `old pages ${wa.from + 1}–${wa.to + 1} vs new pages ${wb.from + 1}–${wb.to + 1}`;
+  const stat = (n, label) => (n ? `<span class="stat"><b>${n}</b> ${label}</span>` : "");
+  const stats = [
+    `<span class="stat"><b>${S.pairs.length}</b> page pair${S.pairs.length === 1 ? "" : "s"}</span>`,
+    stat(counts.changed, "changed"), stat(counts.same, "unchanged"),
+    stat(counts.flow, "re-paginated"), stat(counts.removed, "only in old"), stat(counts.added, "only in new"),
+    d && !d.empty ? `<span class="stat"><b>−${d.delCount} +${d.insCount}</b> words${d.movedCount ? `, <b>${d.movedCount}</b> moved` : ""}</span>` : "",
+  ].filter(Boolean).join("");
+  const rows = S.pairs.map((p, i) => {
+    const st = S.scan[i]?.status || "pending";
+    return `<tr><td>${esc(pairLong(p))}</td><td><span class="st ${st}">${esc(STATUS_LABEL[st])}</span></td></tr>`;
+  }).join("");
+
+  let body;
+  if (!d || d.empty) body = `<p class="muted">No text layer in either file — only the page views apply.</p>`;
+  else if (!d.delCount && !d.insCount && !d.movedCount) body = `<p class="muted">No text differences once page furniture is ignored.</p>`;
+  else {
+    const parts = [];
+    for (const o of d.ops) {
+      const t = esc(o.words.join(" "));
+      if (o.t === "=") {
+        parts.push(o.words.length > 60
+          ? `${esc(o.words.slice(0, 25).join(" "))} <span class="fold">⋯ ${o.words.length - 50} unchanged words ⋯</span> ${esc(o.words.slice(-25).join(" "))}`
+          : t);
+      } else if (o.t === "-") parts.push(`<del>${t}</del>`);
+      else if (o.t === "+") parts.push(`<ins>${t}</ins>`);
+      else parts.push(`<span class="mov" title="${o.t === "<" ? "moved away from here" : "moved here"} (text unchanged)">${t}</span>`);
+    }
+    body = `<p class="diff">${parts.join(" ")}</p>`;
+  }
+
+  const when = new Date().toISOString().slice(0, 10);
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(S.A.name)} vs ${esc(S.B.name)} — diffcat report</title>
+<style>
+  :root { --ink:#1d1c1a; --muted:#6e6a63; --rule:#e2ded6; --del:#b3261e; --ins:#0e6b52; --chg:#c77400; }
+  * { box-sizing:border-box; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  body { margin:0; background:#fff; color:var(--ink); font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:52rem; margin:0 auto; padding:2.5rem 1.4rem 4rem; }
+  h1 { font-size:1.5rem; line-height:1.2; margin:0 0 .4rem; }
+  h1 small { display:block; font-size:.8rem; font-weight:400; color:var(--muted); margin-top:.35rem; }
+  h2 { font-size:1.05rem; margin:2rem 0 .7rem; }
+  .stats { display:flex; flex-wrap:wrap; gap:.4rem 1.6rem; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.8rem; color:var(--muted); margin:1rem 0 0; }
+  .stats b { color:var(--ink); font-weight:600; }
+  table { border-collapse:collapse; font-size:.86rem; width:100%; }
+  td { padding:.28rem .6rem .28rem 0; border-bottom:1px solid var(--rule); vertical-align:top; }
+  .st { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.74rem; padding:.05rem .4rem; border-radius:2px; border:1px solid var(--rule); }
+  .st.changed, .st.flow { border-color:var(--chg); color:var(--chg); }
+  .st.added { border-color:var(--ins); color:var(--ins); }
+  .st.removed { border-color:var(--del); color:var(--del); }
+  .diff { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.84rem; line-height:1.85; overflow-wrap:anywhere; }
+  del { color:var(--del); background:rgba(179,38,30,.12); text-decoration:line-through; padding:0 2px; border-radius:2px; }
+  ins { color:var(--ins); background:rgba(14,107,82,.12); text-decoration:none; padding:0 2px; border-radius:2px; }
+  .mov { color:var(--muted); text-decoration:underline dotted; text-underline-offset:3px; }
+  .fold { color:var(--muted); border:1px solid var(--rule); border-radius:2px; padding:0 .4rem; font-size:.76rem; }
+  .muted { color:var(--muted); }
+  .legend { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.76rem; color:var(--muted); margin:.4rem 0 0; }
+  footer { margin-top:2.5rem; border-top:1px solid var(--rule); padding-top:.8rem; font-size:.78rem; color:var(--muted); }
+  @page { margin:16mm; }
+</style></head><body><main>
+<h1>${esc(S.A.name)} <span class="muted">→</span> ${esc(S.B.name)}<small>compared ${when} · ${esc(scope)} · ${S.A.pageCount} vs ${S.B.pageCount} pages · generated locally by diffcat, nothing was uploaded</small></h1>
+<div class="stats">${stats}</div>
+<h2>Page map</h2>
+<table><tbody>${rows}</tbody></table>
+<h2>Text changes across the whole document</h2>
+<p class="legend"><del>removed</del> · <ins>added</ins> · <span class="mov">moved</span> · running heads, page numbers and hyphenation are ignored</p>
+${body}
+<footer>Made with <a href="https://nipunbatra.github.io/diffcat/">diffcat</a> — compare two PDFs entirely in your browser.</footer>
+</main></body></html>
+`;
+}
+
+/* ---------- built-in sample pair (generated locally) ---------- */
+
+function samplePdfBytes(version) {
+  const m = S.mupdf;
+  const doc = new m.PDFDocument();
+  try {
+    const res = doc.newDictionary();
+    const fonts = doc.newDictionary();
+    fonts.put("F0", doc.addSimpleFont(new m.Font("Helvetica")));
+    fonts.put("F1", doc.addSimpleFont(new m.Font("Helvetica-Bold")));
+    res.put("Font", fonts);
+    const esc = (s) => s.replace(/[\\()]/g, (c) => "\\" + c);
+    const T = (f, size, x, y, s) => `BT /${f} ${size} Tf ${x} ${y} Td (${esc(s)}) Tj ET\n`;
+    const page = (content) => doc.insertPage(-1, doc.addPage([0, 0, 612, 792], 0, res, content));
+
+    // version 2 gains a cover page — exercises the page realignment
+    if (version === 2) {
+      let p0 = T("F1", 26, 72, 700, "TRAVEL POLICY");
+      p0 += T("F0", 13, 72, 660, "Cover sheet added in the new revision.");
+      page(p0);
+    }
+
+    let p1 = T("F1", 22, 72, 716, "ACME LOGISTICS - TRAVEL POLICY");
+    p1 += "72 700 468 2 re f\n";
+    const rows = version === 1 ? [
+      "Effective date: January 2026",
+      "Daily meal allowance: USD 45",
+      "Hotel cap: USD 180 per night",
+      "Approval: manager signature required",
+      "Flights: economy class only",
+    ] : [
+      "Effective date: March 2026",
+      "Daily meal allowance: USD 60",
+      "Hotel cap: USD 180 per night",
+      "Approval: self-serve below USD 500",
+      "Flights: economy class only",
+      "New: rail travel is always pre-approved",
+    ];
+    let y = 640;
+    for (const r of rows) { p1 += T("F0", 14, 72, y, r); y -= 34; }
+    p1 += T("F0", 10, 72, 80, `fake sample document - version ${version} - generated locally by diffcat`);
+    page(p1);
+
+    let p2 = T("F1", 18, 72, 716, "APPENDIX A - DEFINITIONS");
+    for (let k = 0; k < 6; k++) {
+      p2 += T("F0", 12, 72, 660 - k * 28, `${k + 1}. This clause is identical in both versions of the document.`);
+    }
+    page(p2);
+
+    const buf = doc.saveToBuffer("compress=yes");
+    const bytes = buf.asUint8Array().slice();
+    buf.destroy?.();
+    return bytes;
+  } finally {
+    try { doc.destroy(); } catch {}
+  }
+}
+
+/* ---------- wiring ---------- */
+
+els.close.addEventListener("click", startOver);
+
+for (const side of ["A", "B"]) {
+  const slot = els.slotEl[side];
+  const input = els.slotInput[side];
+  slot.addEventListener("click", () => input.click());
+  slot.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+  });
+  input.addEventListener("change", () => {
+    if (input.files[0]) openSideFile(side, input.files[0]);
+    input.value = "";
+  });
+  slot.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    slot.classList.add("dragover");
+  });
+  slot.addEventListener("dragleave", () => slot.classList.remove("dragover"));
+  slot.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    slot.classList.remove("dragover");
+    const f = e.dataTransfer.files[0];
+    if (f) openSideFile(side, f);
+  });
+}
+
+// drops anywhere else: two files fill both sides, one file fills the first empty slot
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  const files = [...e.dataTransfer.files];
+  if (files.length >= 2) openPair(files[0], files[1]);
+  else if (files.length === 1) {
+    const side = !S.A ? "A" : !S.B ? "B" : null;
+    if (side) openSideFile(side, files[0]);
+  }
+});
+
+els.swap.addEventListener("click", async () => {
+  if (!S.A || !S.B) return;
+  [S.A, S.B] = [S.B, S.A];
+  [S.winA, S.winB] = [S.winB, S.winA];
+  invalidateCompare();
+  updateSlots();
+  await beginCompare();
+});
+
+els.rangeapply.addEventListener("click", applyRange);
+els.rangeall.addEventListener("click", () => {
+  S.winA = S.winB = null;
+  updateRangeBar();
+  applyRange();
+});
+for (const side of ["A", "B"]) {
+  for (const input of els.rangeIn[side]) {
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); applyRange(); }
+    });
+  }
+}
+
+els.sample.addEventListener("click", async () => {
+  try {
+    await ensureEngine();
+    await busy("writing the sample pair…");
+    const v1 = samplePdfBytes(1);
+    const v2 = samplePdfBytes(2);
+    unbusy();
+    await openSideBytes("A", "policy-v1.pdf", v1);
+    await openSideBytes("B", "policy-v2.pdf", v2);
+  } catch (err) {
+    unbusy();
+    alert(`Couldn't build the sample.\n\n${err.message || err}`);
+  }
+});
+
+els.modes.addEventListener("click", (e) => {
+  const btn = e.target.closest(".tool");
+  if (!btn) return;
+  S.userMode = btn.dataset.mode;
+  els.note.hidden = true;
+  setMode(btn.dataset.mode);
+});
+
+els.hl.addEventListener("click", () => {
+  S.highlights = !S.highlights;
+  els.hl.classList.toggle("on", S.highlights);
+  els.hl.setAttribute("aria-pressed", String(S.highlights));
+  drawViews();
+});
+
+els.prev.addEventListener("click", () => cGotoPage(S.pageIndex - 1));
+els.next.addEventListener("click", () => cGotoPage(S.pageIndex + 1));
+
+window.addEventListener("keydown", (e) => {
+  if (els.compare.hidden || !els.busy.hidden) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  if (e.key === "ArrowLeft") { e.preventDefault(); cGotoPage(S.pageIndex - 1); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); cGotoPage(S.pageIndex + 1); }
+});
+
+let swiping = false;
+els.cvO.addEventListener("pointerdown", (e) => {
+  if (S.mode !== "swipe" || e.button !== 0) return;
+  swiping = true;
+  els.cvO.setPointerCapture(e.pointerId);
+  moveSwipe(e);
+});
+els.cvO.addEventListener("pointermove", (e) => { if (swiping) moveSwipe(e); });
+els.cvO.addEventListener("pointerup", () => { swiping = false; });
+function moveSwipe(e) {
+  const r = els.cvO.getBoundingClientRect();
+  S.swipeX = Math.min(0.98, Math.max(0.02, (e.clientX - r.left) / r.width));
+  drawViews();
+}
+
+els.image.addEventListener("click", () => {
+  const e = S.cache.get(S.pageIndex);
+  if (!e || !S.A || !S.B || S.mode === "text") return;
+  const pad = 14, header = 30;
+  const out = document.createElement("canvas");
+  const sideBySide = S.mode === "side";
+  out.width = sideBySide ? e.w * 2 + pad * 3 : e.w + pad * 2;
+  out.height = e.h + header + pad * 2;
+  const g = out.getContext("2d");
+  g.fillStyle = "#ffffff";
+  g.fillRect(0, 0, out.width, out.height);
+  g.fillStyle = "#141412";
+  g.font = `700 ${Math.max(12, Math.round(e.w / 70))}px ui-monospace, Menlo, monospace`;
+  const title = `${S.A.name}  vs  ${S.B.name} — ${pairLong(S.pairs[S.pageIndex])} (${S.mode === "side" ? "side by side" : S.mode})`;
+  g.fillText(title, pad, header - 8, out.width - pad * 2);
+  if (sideBySide) {
+    g.drawImage(els.cvA, pad, header + pad);
+    g.drawImage(els.cvB, e.w + pad * 2, header + pad);
+  } else {
+    g.drawImage(els.cvO, pad, header + pad);
+  }
+  out.toBlob((blob) => {
+    if (!blob) { alert("Export failed — the diff image may be too large for this browser."); return; }
+    downloadBlob(blob, `${baseName(S.A.name)}-vs-${baseName(S.B.name)}.page${S.pageIndex + 1}.png`);
+  }, "image/png");
+});
+
+els.download.addEventListener("click", async () => {
+  if (!S.A || !S.B || !S.pairs.length) return;
+  if (!S.docDiff) {
+    await busy("reading both documents…");
+    try { computeDocDiff(); } finally { unbusy(); }
+  }
+  downloadBlob(new Blob([buildReport()], { type: "text/html" }),
+    `${baseName(S.A.name)}-vs-${baseName(S.B.name)}.report.html`);
+});
+
+/* ---------- test hooks (harmless in production: everything is client-side anyway) ---------- */
+
+window.__diffcatOpen = async (files) => {
+  if (files?.length >= 2) await openPair(files[0], files[1]);
+  else if (files?.length === 1) await openSideFile(!S.A ? "A" : "B", files[0]);
+};
+
+window.__diffcat = {
+  state: S,
+  gotoPage: cGotoPage,
+  openBytes: openSideBytes,
+  applyRange,
+  setMode,
+  startOver,
+};
