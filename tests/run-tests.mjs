@@ -119,7 +119,7 @@ const waitDocDiff = (page) => page.waitForFunction(
 const docWords = (page) => page.evaluate(() => {
   const d = window.__diffcat.state.docDiff;
   const words = (t) => d.ops.filter((o) => o.t === t).flatMap((o) => o.words);
-  return { del: words("-"), ins: words("+"), out: words("<"), into: words(">"),
+  return { del: words("-"), ins: words("+"), out: words("<"), into: words(">"), same: words("="),
            delCount: d.delCount, insCount: d.insCount, moved: d.movedCount };
 });
 
@@ -364,7 +364,18 @@ test("text view sees through reflow — exactly one changed word", async () => {
   assert(ui.status.includes("−1 +1 words"), `doc status: "${ui.status}"`);
   assert(!ui.panel.includes("REFLOW REPORT"), "running head stripped from the text view");
   assert(ui.panel.includes("information processing"), "hyphenated word rejoined");
-  assert(ui.stripHidden && ui.pagerHidden && ui.imageHidden, "page-only controls hidden in the text view");
+  assert(ui.stripHidden && ui.imageHidden && !ui.pagerHidden, "page-only controls hidden, pager kept for change navigation");
+  // the pager steps through changes in the text view
+  assertEq(await page.$eval("#cpageinfo", (e) => e.textContent), "1 change", "pager counts the hunks");
+  await page.keyboard.press("ArrowRight");
+  const nav = await page.evaluate(() => ({
+    info: document.getElementById("cpageinfo").textContent,
+    flashed: document.querySelector("#cdoctext .flash")?.textContent,
+    nextDisabled: document.getElementById("cnext").disabled,
+  }));
+  assertEq(nav.info, "change 1 / 1", "arrow key moves to the first change");
+  assertEq(nav.flashed, "efficiency", "the change is highlighted");
+  assert(nav.nextDisabled, "no further change to step to");
   await page.click("#cdownload");
   const html = (await waitDownload("reflowv1-vs-reflowv2.report.html")).toString("utf8");
   assert(html.includes("<del>efficiency</del>") && html.includes("<ins>throughput</ins>"), "report shows the one edit");
@@ -601,6 +612,47 @@ test("tightly justified text without space glyphs still diffs word by word", asy
   assertEq(perPage.words, 27, "every word on the tight page is its own box");
   assert(perPage.del === 1 && perPage.ins === 1, `page view sees one changed word: −${perPage.del} +${perPage.ins}`);
   assertEq(errors.length, 0, `console errors: ${errors.join(" | ")}`);
+  await page.close();
+});
+
+// Each pair differs only in typesetting; the text view must see nothing.
+const NOISE_PAIRS = [
+  ["hyphv1.pdf", "hyphv2.pdf", "words broken at line ends", ["memory-based", "information", "non-representational"]],
+  ["dashv1.pdf", "dashv2.pdf", "dash styles", ["Perception - An", "127-138"]],
+  ["supv1.pdf", "supv2.pdf", "footnote markers around punctuation", ["theories.", "[1]", "A footnote line"]],
+  ["rotv1.pdf", "rotv2.pdf", "a rotated page", ["Rotation must not change the words we read."]],
+];
+test("typesetting noise is not a difference: hyphenation, dashes, footnote markers, rotation", async () => {
+  for (const [a, b, what, keeps] of NOISE_PAIRS) {
+    const { page, errors } = await newPage();
+    await uploadPair(page, a, b);
+    await waitScan(page);
+    await page.click('#cmodes [data-mode="text"]');
+    await waitDocDiff(page);
+    const w = await docWords(page);
+    assertEq(w.delCount + w.insCount + w.moved, 0,
+      `${what}: no text differences (got −${w.delCount} +${w.insCount} ~${w.moved}: ${JSON.stringify(w.del)} ${JSON.stringify(w.ins)})`);
+    const text = w.same.join(" ");
+    for (const k of keeps) assert(text.includes(k), `${what}: extracted text keeps "${k}" — got "${text.slice(0, 160)}"`);
+    assertEq(errors.length, 0, `${what}: console errors: ${errors.join(" | ")}`);
+    await page.close();
+  }
+});
+
+test("a file compared with itself reports no differences anywhere", async () => {
+  const { page } = await newPage();
+  await uploadPair(page, "diffv1.pdf", "diffv1.pdf");
+  await waitScan(page);
+  const st = await page.evaluate(() => ({
+    statuses: window.__diffcat.state.scan.map((s) => s.status),
+    summary: document.getElementById("csummary").textContent,
+  }));
+  assert(st.statuses.every((s) => s === "same"), `all pages unchanged: ${st.statuses}`);
+  assert(st.summary.includes("no differences found"), `summary: "${st.summary}"`);
+  await page.click('#cmodes [data-mode="text"]');
+  await waitDocDiff(page);
+  const w = await docWords(page);
+  assertEq(w.delCount + w.insCount + w.moved, 0, "text view sees nothing");
   await page.close();
 });
 
